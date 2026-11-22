@@ -2,43 +2,50 @@
 inspect.py
 ----------
 Режим инспекции платы — основной пайплайн:
-  1. Захват изображения с камеры (или загрузка файла)
+  1. Захват изображения с камеры oCam-1MGN-U (или вебкамеры / файла)
   2. Разбивка на тайлы (tiling.py)
-  3. Классификация каждого тайла (PCBNet)
+  3. Пакетная классификация каждого тайла (PCBNet)
   4. Визуализация результата с цветными метками
 
-Запуск с вебкамерой (live-режим):
-    python inspect.py --source camera
+Запуск с камерой (live-режим):
+    python pcb_inspect.py --source camera
 
 Запуск на изображении:
-    python inspect.py --source image --file path/to/pcb.jpg
+    python pcb_inspect.py --source image --file path/to/pcb.jpg
 
 Запуск демо (синтетическая плата):
-    python inspect.py --source demo
+    python pcb_inspect.py --source demo
 """
 
 import os
 import sys
 import argparse
 import time
+from collections import Counter
 import numpy as np
 import cv2
 import torch
 from torchvision import transforms
 from PIL import Image
 
-# ── Импорты из нашего проекта ──
+# Импорты из нашего проекта
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
 sys.path.insert(0, BASE_DIR)
+sys.path.insert(0, ROOT_DIR)
 
 from model import PCBNet
 from tiling import tile_image, visualize_grid, make_demo_board
+try:
+    from ocam import OCam
+except ImportError:
+    OCam = None
 
-# ─────────────────────── Параметры ───────────────────────────
-TILE_SIZE   = 64
-OVERLAP     = 8
-MODEL_PATH  = os.path.join(BASE_DIR, "models", "pcbnet_best.pt")
-DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
+# Параметры
+TILE_SIZE = 64
+OVERLAP = 8
+MODEL_PATH = os.path.join(BASE_DIR, "models", "pcbnet_best.pt")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CLASS_COLORS = {
     "resistor":  (255,  80,  80),
@@ -47,14 +54,10 @@ CLASS_COLORS = {
     "empty":     (100, 100, 100),
 }
 
-# Нормализация (должна совпадать с train.py)
+# Нормализация
 NORMALIZE = transforms.Normalize(mean=[0.4, 0.5, 0.2], std=[0.2, 0.2, 0.1])
 TO_TENSOR = transforms.ToTensor()
 
-
-# ═══════════════════════════════════════════════════════════════
-#  Загрузка модели
-# ═══════════════════════════════════════════════════════════════
 
 def load_model(path: str, device: str):
     if not os.path.exists(path):
@@ -72,33 +75,42 @@ def load_model(path: str, device: str):
     return model, classes
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Классификация тайлов
-# ═══════════════════════════════════════════════════════════════
-
 @torch.no_grad()
 def classify_tiles(
     model: PCBNet,
     tiles: list[dict],
     classes: list[str],
     device: str,
+    batch_size: int = 64
 ) -> list[str]:
-    """Классифицирует каждый тайл, возвращает список предсказанных классов."""
+    """Классифицирует тайлы пакетами (батчами) для высокой скорости."""
     predictions = []
+    tensors = []
+
     for t in tiles:
-        # Преобразуем BGR→RGB, PIL→тензор
-        rgb = cv2.cvtColor(t["tile"], cv2.COLOR_BGR2RGB)
+        tile = t["tile"]
+        if len(tile.shape) == 2:
+            rgb = cv2.cvtColor(tile, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = cv2.cvtColor(tile, cv2.COLOR_BGR2RGB)
+
         pil = Image.fromarray(rgb).resize((TILE_SIZE, TILE_SIZE))
-        tensor = NORMALIZE(TO_TENSOR(pil)).unsqueeze(0).to(device)
-        logits = model(tensor)
-        idx = logits.argmax(dim=1).item()
-        predictions.append(classes[idx])
+        tensor = NORMALIZE(TO_TENSOR(pil))
+        tensors.append(tensor)
+
+        if len(tensors) >= batch_size:
+            batch = torch.stack(tensors).to(device)
+            preds = model(batch).argmax(dim=1).tolist()
+            predictions.extend([classes[i] for i in preds])
+            tensors = []
+
+    if tensors:
+        batch = torch.stack(tensors).to(device)
+        preds = model(batch).argmax(dim=1).tolist()
+        predictions.extend([classes[i] for i in preds])
+
     return predictions
 
-
-# ═══════════════════════════════════════════════════════════════
-#  Режим: демо-синтетическая плата
-# ═══════════════════════════════════════════════════════════════
 
 def run_demo(model, classes, device):
     print("\n  [Демо] Генерируем синтетическую плату...")
@@ -110,15 +122,12 @@ def run_demo(model, classes, device):
 
     vis_rgb = visualize_grid(board_rgb, tiles, preds, CLASS_COLORS)
 
-    # Статистика
-    from collections import Counter
     counts = Counter(preds)
     print(f"\n  Результат инспекции ({len(tiles)} тайлов):")
     for cls, n in sorted(counts.items()):
         bar = "█" * n
         print(f"    {cls:12s}: {n:3d}  {bar}")
 
-    # Сохраняем
     out_path = os.path.join(BASE_DIR, "results", "inspection_demo.png")
     cv2.imwrite(out_path, cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR))
     print(f"\n  Сохранено: {out_path}")
@@ -129,29 +138,41 @@ def run_demo(model, classes, device):
     cv2.destroyAllWindows()
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Режим: live-камера
-# ═══════════════════════════════════════════════════════════════
+def run_camera(model, classes, device, cam_id: int = 1):
+    cam = None
+    if OCam is not None:
+        try:
+            cam = OCam(index=cam_id, width=1280, height=960, threaded=True, auto_fallback=True)
+            print(f"  [+] oCam подключена на индексе {cam.index} ({cam.resolution[0]}x{cam.resolution[1]})")
+        except Exception as e:
+            print(f"  [!] oCam не открылась ({e}), переход на standard VideoCapture...")
 
-def run_camera(model, classes, device, cam_id: int = 0):
-    cap = cv2.VideoCapture(cam_id)
-    if not cap.isOpened():
-        print(f"  Ошибка: не удалось открыть камеру (id={cam_id})")
-        return
+    if cam is None:
+        cap = cv2.VideoCapture(cam_id)
+        if not cap.isOpened():
+            print(f"  Ошибка: не удалось открыть камеру (id={cam_id})")
+            return
+    else:
+        cap = None
 
-    print(f"\n  [Camera] Нажмите Q для выхода, S для сохранения скриншота")
+    print(f"\n  [Camera] [SPACE]=Инспекция, [Q]=Выход, [S]=Сохранить")
     frame_i = 0
+    vis_bgr = None
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        if cam is not None:
+            ret, frame = cam.read_bgr()
+        else:
+            ret, frame = cap.read()
 
-        # Инспекция каждые 10 кадров (экономим CPU)
-        if frame_i % 10 == 0:
+        if not ret or frame is None:
+            time.sleep(0.01)
+            continue
+
+        if vis_bgr is None or frame_i % 15 == 0:
             tiles = tile_image(frame, tile_size=TILE_SIZE, overlap=OVERLAP)
             preds = classify_tiles(model, tiles, classes, device)
-            vis   = visualize_grid(
+            vis = visualize_grid(
                 cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
                 tiles, preds, CLASS_COLORS
             )
@@ -174,13 +195,12 @@ def run_camera(model, classes, device, cam_id: int = 0):
 
         frame_i += 1
 
-    cap.release()
+    if cam is not None:
+        cam.release()
+    if cap is not None:
+        cap.release()
     cv2.destroyAllWindows()
 
-
-# ═══════════════════════════════════════════════════════════════
-#  Режим: файл изображения
-# ═══════════════════════════════════════════════════════════════
 
 def run_image(model, classes, device, file_path: str):
     if not os.path.exists(file_path):
@@ -197,7 +217,6 @@ def run_image(model, classes, device, file_path: str):
     )
     vis_bgr = cv2.cvtColor(vis_rgb, cv2.COLOR_RGB2BGR)
 
-    from collections import Counter
     counts = Counter(preds)
     print(f"\n  Результат ({len(tiles)} тайлов):")
     for cls, n in sorted(counts.items()):
@@ -211,10 +230,6 @@ def run_image(model, classes, device, file_path: str):
     cv2.destroyAllWindows()
 
 
-# ═══════════════════════════════════════════════════════════════
-#  Точка входа
-# ═══════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PCB Tile Inspector")
     parser.add_argument(
@@ -222,7 +237,7 @@ if __name__ == "__main__":
         help="Источник: demo / camera / image"
     )
     parser.add_argument("--file",   default=None, help="Путь к изображению (для --source image)")
-    parser.add_argument("--cam_id", type=int, default=0, help="ID камеры (по умолчанию 0)")
+    parser.add_argument("--cam_id", type=int, default=1, help="ID камеры (по умолчанию 1)")
     args = parser.parse_args()
 
     print("=" * 55)
